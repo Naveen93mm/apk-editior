@@ -3,48 +3,38 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Package Bench</title>
+<title>Skin Bench</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">▣</span>
-      <span class="brand-name">Package Bench</span>
+      <span class="brand-mark">◈</span>
+      <span class="brand-name">Skin Bench</span>
     </div>
     <a class="logout" href="{{ url_for('logout') }}">Sign out</a>
   </header>
 
-  <main class="board">
+  <main class="board narrow">
     {% with messages = get_flashed_messages() %}
       {% if messages %}
         <div class="alert">{{ messages[0] }}</div>
       {% endif %}
     {% endwith %}
 
-    <div class="lanes">
-      <section class="lane">
-        <div class="lane-index">01</div>
-        <h2>APK → ZIP</h2>
-        <p>Upload an .apk file. It comes back unpacked as a plain .zip, ready to edit.</p>
-        <form action="{{ url_for('apk_to_zip') }}" method="POST" enctype="multipart/form-data">
-          <input type="file" name="file" accept=".apk" required>
-          <button type="submit">Convert to ZIP</button>
-        </form>
-      </section>
+    <section class="lane">
+      <div class="lane-index">01</div>
+      <h2>Upload a game APK</h2>
+      <p>It gets unpacked into its logo, images, audio and colors, ready to restyle.</p>
+      <form action="{{ url_for('upload') }}" method="POST" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".apk" required>
+        <button type="submit">Unpack APK</button>
+      </form>
+    </section>
 
-      <div class="lane-divider" aria-hidden="true"></div>
-
-      <section class="lane">
-        <div class="lane-index">02</div>
-        <h2>ZIP → APK</h2>
-        <p>Upload the edited .zip file. It comes back rebuilt as a debug-signed .apk.</p>
-        <form action="{{ url_for('zip_to_apk') }}" method="POST" enctype="multipart/form-data">
-          <input type="file" name="file" accept=".zip" required>
-          <button type="submit">Convert to APK</button>
-        </form>
-      </section>
-    </div>
+    {% if has_project %}
+    <p class="hint"><a href="{{ url_for('project') }}">Continue with your current project →</a></p>
+    {% endif %}
   </main>
 </body>
 </html>

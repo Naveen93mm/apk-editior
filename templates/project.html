@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Skin Bench — Project</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◈</span>
+      <span class="brand-name">Skin Bench</span>
+    </div>
+    <div class="topbar-actions">
+      <a class="ghost-link" href="{{ url_for('dashboard') }}">Upload a different APK</a>
+      <a class="logout" href="{{ url_for('logout') }}">Sign out</a>
+    </div>
+  </header>
+
+  <main class="board">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="alert">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+
+    <!-- App name -->
+    <section class="panel">
+      <h2>App name</h2>
+      <form action="{{ url_for('rename_app') }}" method="POST" class="inline-form">
+        <input type="text" name="app_name" value="{{ app_name or '' }}" placeholder="App display name" required>
+        <button type="submit">Save</button>
+      </form>
+    </section>
+
+    <!-- Logo -->
+    <section class="panel">
+      <h2>Logo</h2>
+      {% if icons %}
+      <div class="asset-grid">
+        {% for path in icons %}
+        <div class="asset-card">
+          <img src="{{ url_for('asset_preview', path=path) }}" alt="{{ path }}">
+          <p class="asset-path">{{ path }}</p>
+          <form action="{{ url_for('replace_asset') }}" method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="rel_path" value="{{ path }}">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">Replace</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="muted">No launcher icon found in this APK.</p>
+      {% endif %}
+    </section>
+
+    <!-- Colors -->
+    <section class="panel">
+      <h2>Colors</h2>
+      {% if colors %}
+      <form action="{{ url_for('update_colors') }}" method="POST" class="color-form">
+        {% for c in colors %}
+        <div class="color-row">
+          <input type="color" value="{{ c.value[:7] }}" data-pair="{{ c.name }}">
+          <input type="text" name="color:{{ c.name }}" value="{{ c.value }}" data-pair="{{ c.name }}" class="color-hex">
+          <span class="color-name">{{ c.name }}</span>
+        </div>
+        {% endfor %}
+        <button type="submit">Save colors</button>
+      </form>
+      {% else %}
+      <p class="muted">No editable colors.xml found in this APK.</p>
+      {% endif %}
+    </section>
+
+    <!-- Images -->
+    <section class="panel">
+      <h2>Images &amp; backgrounds</h2>
+      {% if images %}
+      <div class="asset-grid">
+        {% for path in images %}
+        <div class="asset-card">
+          <img src="{{ url_for('asset_preview', path=path) }}" alt="{{ path }}" loading="lazy">
+          <p class="asset-path">{{ path }}</p>
+          <form action="{{ url_for('replace_asset') }}" method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="rel_path" value="{{ path }}">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">Replace</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% if truncated_images %}<p class="muted">Showing the first 150 images.</p>{% endif %}
+      {% else %}
+      <p class="muted">No image assets found.</p>
+      {% endif %}
+    </section>
+
+    <!-- Audio -->
+    <section class="panel">
+      <h2>Music &amp; sound</h2>
+      {% if audio %}
+      <div class="audio-list">
+        {% for path in audio %}
+        <div class="audio-row">
+          <audio controls preload="none" src="{{ url_for('asset_preview', path=path) }}"></audio>
+          <p class="asset-path">{{ path }}</p>
+          <form action="{{ url_for('replace_asset') }}" method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="rel_path" value="{{ path }}">
+            <input type="file" name="file" accept="audio/*" required>
+            <button type="submit">Replace</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% if truncated_audio %}<p class="muted">Showing the first 150 audio files.</p>{% endif %}
+      {% else %}
+      <p class="muted">No audio assets found.</p>
+      {% endif %}
+    </section>
+
+    <!-- Build -->
+    <section class="panel build-panel">
+      <h2>Build</h2>
+      <p class="muted">Repacks and debug-signs the APK with everything you changed above.</p>
+      <form action="{{ url_for('build_project') }}" method="POST">
+        <button type="submit" class="build-btn">Build &amp; download APK</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    // Keep each color swatch and its hex text field in sync.
+    document.querySelectorAll('[data-pair]').forEach(function (el) {
+      el.addEventListener('input', function () {
+        var pair = el.getAttribute('data-pair');
+        document.querySelectorAll('[data-pair="' + pair + '"]').forEach(function (other) {
+          if (other !== el) {
+            other.value = el.type === 'color' ? el.value : el.value.slice(0, 7);
+          }
+        });
+      });
+    });
+  </script>
+</body>
+</html>
