@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Package Bench</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">▣</span>
+      <span class="brand-name">Package Bench</span>
+    </div>
+    <a class="logout" href="{{ url_for('logout') }}">Sign out</a>
+  </header>
+
+  <main class="board">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="alert">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+
+    <div class="lanes">
+      <section class="lane">
+        <div class="lane-index">01</div>
+        <h2>APK → ZIP</h2>
+        <p>Upload an .apk file. It comes back unpacked as a plain .zip, ready to edit.</p>
+        <form action="{{ url_for('apk_to_zip') }}" method="POST" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".apk" required>
+          <button type="submit">Convert to ZIP</button>
+        </form>
+      </section>
+
+      <div class="lane-divider" aria-hidden="true"></div>
+
+      <section class="lane">
+        <div class="lane-index">02</div>
+        <h2>ZIP → APK</h2>
+        <p>Upload the edited .zip file. It comes back rebuilt as a debug-signed .apk.</p>
+        <form action="{{ url_for('zip_to_apk') }}" method="POST" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".zip" required>
+          <button type="submit">Convert to APK</button>
+        </form>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
