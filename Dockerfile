@@ -39,5 +39,7 @@ ENV SECRET_KEY=change-this-secret-key
 
 EXPOSE 80
 
-# Long timeout: decoding/rebuilding a big game APK takes real time
-CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "2", "--timeout", "900", "app:app"]
+# Single worker: progress tracking lives in that process's memory, so every
+# poll request must land on the same worker as the one running the job.
+# Long timeout: decoding/rebuilding a big game APK takes real time.
+CMD ["gunicorn", "--bind", "0.0.0.0:80", "--workers", "1", "--threads", "4", "--timeout", "900", "app:app"]

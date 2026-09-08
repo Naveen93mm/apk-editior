@@ -2,13 +2,15 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from functools import wraps
 
 from flask import (
     Flask, request, render_template, redirect,
-    url_for, session, send_file, flash, abort
+    url_for, session, send_file, flash, abort, jsonify
 )
 
 APP_SECRET = os.environ.get("SECRET_KEY", "change-this-secret-key")
@@ -25,6 +27,7 @@ SIGNER_JAR = os.environ.get("SIGNER_JAR", "/opt/uber-apk-signer.jar")
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp")
 AUDIO_EXT = (".mp3", ".ogg", ".wav", ".m4a")
 ICON_NAME_HINT = "ic_launcher"
+SPLASH_NAME_HINTS = ("splash", "loading", "load_", "_load", "boot", "launch_screen", "startup")
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET
@@ -54,6 +57,121 @@ def current_job_dir():
     return d
 
 
+# --------------------------------------------------------- progress tasks
+# In-memory tracker for long-running jobs (decode / build+sign), polled by
+# the browser to drive the loading bar. Fine for a single small deployment.
+TASKS = {}
+
+
+def estimate_seconds(size_mb, base=6, per_mb=0.6, min_s=6, max_s=240):
+    return min(max_s, max(min_s, base + size_mb * per_mb))
+
+
+def dir_size_mb(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+
+def run_cmd_with_progress(task_id, cmd, base_percent, weight, duration, message):
+    """Runs cmd, animating the task's percent from base_percent up to
+    base_percent+weight over `duration` seconds while it's alive (capped
+    short of the ceiling so it doesn't look "done" before it truly is)."""
+    TASKS[task_id]["message"] = message
+    start = time.time()
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    while process.poll() is None:
+        elapsed = time.time() - start
+        progress_fraction = min(0.97, elapsed / duration) if duration else 0.97
+        TASKS[task_id]["percent"] = round(base_percent + weight * progress_fraction, 1)
+        TASKS[task_id]["eta_seconds"] = max(0, round(duration - elapsed))
+        time.sleep(0.4)
+
+    _stdout, stderr = process.communicate()
+    return process.returncode, stderr
+
+
+def decode_worker(task_id, job_dir, apk_path):
+    TASKS[task_id] = {
+        "percent": 1, "message": "Decoding APK…", "done": False,
+        "error": None, "redirect": None, "eta_seconds": None,
+    }
+    decoded_dir = os.path.join(job_dir, "decoded")
+    if os.path.isdir(decoded_dir):
+        shutil.rmtree(decoded_dir)
+
+    size_mb = os.path.getsize(apk_path) / (1024 * 1024)
+    duration = estimate_seconds(size_mb)
+    cmd = ["java", "-jar", APKTOOL_JAR, "d", "-f", "-o", decoded_dir, apk_path]
+
+    rc, stderr = run_cmd_with_progress(task_id, cmd, base_percent=1, weight=97,
+                                        duration=duration, message="Decoding APK…")
+    if rc != 0:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        TASKS[task_id].update(done=True, percent=100,
+                               error="Could not open that APK: " + (stderr or "")[-300:])
+        return
+    TASKS[task_id].update(done=True, percent=100, message="Done", redirect="/project")
+
+
+def build_worker(task_id, job_dir):
+    TASKS[task_id] = {
+        "percent": 1, "message": "Rebuilding APK…", "done": False,
+        "error": None, "download_url": None, "eta_seconds": None,
+    }
+    decoded_dir = os.path.join(job_dir, "decoded")
+    unsigned_apk = os.path.join(job_dir, "build", "unsigned.apk")
+    signed_dir = os.path.join(job_dir, "build", "signed")
+    os.makedirs(os.path.dirname(unsigned_apk), exist_ok=True)
+
+    build_duration = estimate_seconds(dir_size_mb(decoded_dir))
+    cmd_build = ["java", "-jar", APKTOOL_JAR, "b", decoded_dir, "-o", unsigned_apk]
+    rc, stderr = run_cmd_with_progress(task_id, cmd_build, base_percent=1, weight=64,
+                                        duration=build_duration, message="Rebuilding APK…")
+    if rc != 0:
+        TASKS[task_id].update(done=True, percent=100,
+                               error="Build failed: " + (stderr or "")[-300:])
+        return
+
+    sign_duration = estimate_seconds(os.path.getsize(unsigned_apk) / (1024 * 1024),
+                                      base=4, per_mb=0.3)
+    cmd_sign = ["java", "-jar", SIGNER_JAR, "-a", unsigned_apk, "--out", signed_dir]
+    rc, stderr = run_cmd_with_progress(task_id, cmd_sign, base_percent=65, weight=33,
+                                        duration=sign_duration, message="Signing APK…")
+    if rc != 0:
+        TASKS[task_id].update(done=True, percent=100,
+                               error="Signing failed: " + (stderr or "")[-300:])
+        return
+
+    signed_apk = None
+    if os.path.isdir(signed_dir):
+        for f in os.listdir(signed_dir):
+            if f.endswith("-aligned-debugSigned.apk") or f.endswith("-debugSigned.apk"):
+                signed_apk = os.path.join(signed_dir, f)
+                break
+        if not signed_apk:
+            for f in os.listdir(signed_dir):
+                if f.endswith(".apk"):
+                    signed_apk = os.path.join(signed_dir, f)
+                    break
+    if not signed_apk:
+        TASKS[task_id].update(done=True, percent=100, error="Signed APK not found.")
+        return
+
+    app_name = read_app_name(decoded_dir) or "app"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", app_name) or "app"
+    TASKS[task_id]["download_path"] = signed_apk
+    TASKS[task_id]["download_name"] = safe_name + ".apk"
+    TASKS[task_id].update(done=True, percent=100, message="Done",
+                           download_url="/project/download/" + task_id)
+
+
 def safe_join(base, rel_path):
     """Resolve rel_path under base, refusing to leave the sandbox."""
     base = os.path.realpath(base)
@@ -63,51 +181,10 @@ def safe_join(base, rel_path):
     return target
 
 
-# ---------------------------------------------------------------- apktool
-
-def run_apktool_decode(apk_path, decoded_dir):
-    if os.path.isdir(decoded_dir):
-        shutil.rmtree(decoded_dir)
-    result = subprocess.run(
-        ["java", "-jar", APKTOOL_JAR, "d", "-f", "-o", decoded_dir, apk_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:] or "apktool decode failed")
-
-
-def run_apktool_build(decoded_dir, out_apk_path):
-    os.makedirs(os.path.dirname(out_apk_path), exist_ok=True)
-    result = subprocess.run(
-        ["java", "-jar", APKTOOL_JAR, "b", decoded_dir, "-o", out_apk_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:] or "apktool build failed")
-
-
-def sign_apk(unsigned_apk_path, signed_out_dir):
-    os.makedirs(signed_out_dir, exist_ok=True)
-    result = subprocess.run(
-        ["java", "-jar", SIGNER_JAR, "-a", unsigned_apk_path, "--out", signed_out_dir],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-2000:] or "signing failed")
-    for f in os.listdir(signed_out_dir):
-        if f.endswith("-aligned-debugSigned.apk") or f.endswith("-debugSigned.apk"):
-            return os.path.join(signed_out_dir, f)
-    # fall back to any apk produced
-    for f in os.listdir(signed_out_dir):
-        if f.endswith(".apk"):
-            return os.path.join(signed_out_dir, f)
-    raise RuntimeError("Signed APK not found in output")
-
-
 # ------------------------------------------------------------- asset scan
 
 def scan_assets(decoded_dir):
-    icons, images, audio = [], [], []
+    icons, splash, images, audio = [], [], [], []
 
     for root, _dirs, files in os.walk(decoded_dir):
         rel_root = os.path.relpath(root, decoded_dir)
@@ -118,19 +195,26 @@ def scan_assets(decoded_dir):
             lower = fname.lower()
             rel_path = os.path.normpath(os.path.join(rel_root, fname))
             if lower.endswith(IMAGE_EXT):
-                (icons if ICON_NAME_HINT in lower else images).append(rel_path)
+                if ICON_NAME_HINT in lower:
+                    icons.append(rel_path)
+                elif any(hint in lower for hint in SPLASH_NAME_HINTS):
+                    splash.append(rel_path)
+                else:
+                    images.append(rel_path)
             elif lower.endswith(AUDIO_EXT):
                 audio.append(rel_path)
 
     images.sort()
     audio.sort()
     icons.sort()
+    splash.sort()
 
     app_name = read_app_name(decoded_dir)
     colors = read_colors(decoded_dir)
 
     return {
         "icons": icons[:20],
+        "splash": splash[:40],
         "images": images[:150],
         "audio": audio[:150],
         "app_name": app_name,
@@ -242,24 +326,28 @@ def dashboard():
 def upload():
     uploaded = request.files.get("file")
     if not uploaded or not uploaded.filename.lower().endswith(".apk"):
-        flash("Please upload a .apk file.")
-        return redirect(url_for("dashboard"))
+        return jsonify(error="Please upload a .apk file."), 400
 
     job_id = uuid.uuid4().hex
     job_dir = job_dir_for(job_id)
     os.makedirs(job_dir, exist_ok=True)
     apk_path = os.path.join(job_dir, "source.apk")
     uploaded.save(apk_path)
-
-    try:
-        run_apktool_decode(apk_path, os.path.join(job_dir, "decoded"))
-    except RuntimeError as exc:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        flash("Could not open that APK: " + str(exc)[:300])
-        return redirect(url_for("dashboard"))
-
     session["job_id"] = job_id
-    return redirect(url_for("project"))
+
+    task_id = uuid.uuid4().hex
+    threading.Thread(target=decode_worker, args=(task_id, job_dir, apk_path),
+                      daemon=True).start()
+    return jsonify(task_id=task_id)
+
+
+@app.route("/status/<task_id>")
+@login_required
+def task_status(task_id):
+    task = TASKS.get(task_id)
+    if not task:
+        return jsonify(error="Unknown task"), 404
+    return jsonify(task)
 
 
 @app.route("/project")
@@ -340,23 +428,21 @@ def replace_asset():
 def build_project():
     job_dir = current_job_dir()
     if not job_dir:
-        return redirect(url_for("dashboard"))
+        return jsonify(error="Upload an APK first."), 400
 
-    decoded_dir = os.path.join(job_dir, "decoded")
-    unsigned_apk = os.path.join(job_dir, "build", "unsigned.apk")
-    signed_dir = os.path.join(job_dir, "build", "signed")
+    task_id = uuid.uuid4().hex
+    threading.Thread(target=build_worker, args=(task_id, job_dir), daemon=True).start()
+    return jsonify(task_id=task_id)
 
-    try:
-        run_apktool_build(decoded_dir, unsigned_apk)
-        signed_apk = sign_apk(unsigned_apk, signed_dir)
-    except RuntimeError as exc:
-        flash("Build failed: " + str(exc)[:300])
-        return redirect(url_for("project"))
 
-    app_name = read_app_name(decoded_dir) or "app"
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", app_name) or "app"
-    return send_file(signed_apk, as_attachment=True,
-                      download_name=safe_name + ".apk")
+@app.route("/project/download/<task_id>")
+@login_required
+def download_build(task_id):
+    task = TASKS.get(task_id)
+    if not task or not task.get("download_path"):
+        abort(404)
+    return send_file(task["download_path"], as_attachment=True,
+                      download_name=task.get("download_name", "app.apk"))
 
 
 if __name__ == "__main__":
