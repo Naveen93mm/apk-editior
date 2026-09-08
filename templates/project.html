@@ -36,7 +36,7 @@
 
     <!-- Logo -->
     <section class="panel">
-      <h2>Logo</h2>
+      <h2>Logo <span class="type-tag">App icon — shown on the home screen</span></h2>
       {% if icons %}
       <div class="asset-grid">
         {% for path in icons %}
@@ -53,6 +53,28 @@
       </div>
       {% else %}
       <p class="muted">No launcher icon found in this APK.</p>
+      {% endif %}
+    </section>
+
+    <!-- Splash / loading screen -->
+    <section class="panel">
+      <h2>Loading screen <span class="type-tag">Shown while the app starts up</span></h2>
+      {% if splash %}
+      <div class="asset-grid">
+        {% for path in splash %}
+        <div class="asset-card">
+          <img src="{{ url_for('asset_preview', path=path) }}" alt="{{ path }}">
+          <p class="asset-path">{{ path }}</p>
+          <form action="{{ url_for('replace_asset') }}" method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="rel_path" value="{{ path }}">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">Replace</button>
+          </form>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="muted">No dedicated loading-screen art detected (some games draw this in code instead of using an image).</p>
       {% endif %}
     </section>
 
@@ -77,7 +99,7 @@
 
     <!-- Images -->
     <section class="panel">
-      <h2>Images &amp; backgrounds</h2>
+      <h2>In-game images &amp; backgrounds <span class="type-tag">Everything else — sprites, backgrounds, buttons</span></h2>
       {% if images %}
       <div class="asset-grid">
         {% for path in images %}
@@ -125,11 +147,33 @@
     <section class="panel build-panel">
       <h2>Build</h2>
       <p class="muted">Repacks and debug-signs the APK with everything you changed above.</p>
-      <form action="{{ url_for('build_project') }}" method="POST">
+      <form id="buildForm" action="{{ url_for('build_project') }}" method="POST">
         <button type="submit" class="build-btn">Build &amp; download APK</button>
       </form>
     </section>
   </main>
+
+  <div id="loadingOverlay" class="loading-overlay hidden">
+    <div class="loading-box">
+      <div class="loading-title" id="loadingTitle">Rebuilding &amp; signing…</div>
+      <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="loading-meta" id="loadingMeta">0%</div>
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='progress.js') }}"></script>
+  <script>
+    document.getElementById("buildForm").addEventListener("submit", function (e) {
+      e.preventDefault();
+      startTrackedJob(this.action, new FormData(this), {
+        title: "Rebuilding & signing…",
+        onDone: function (data, overlay) {
+          overlay.classList.add("hidden");
+          window.location = data.download_url;
+        }
+      });
+    });
+  </script>
 
   <script>
     // Keep each color swatch and its hex text field in sync.
