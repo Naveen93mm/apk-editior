@@ -1,13 +1,14 @@
 import os
+import re
 import shutil
 import subprocess
 import uuid
-import zipfile
+import xml.etree.ElementTree as ET
 from functools import wraps
 
 from flask import (
     Flask, request, render_template, redirect,
-    url_for, session, send_file, flash
+    url_for, session, send_file, flash, abort
 )
 
 APP_SECRET = os.environ.get("SECRET_KEY", "change-this-secret-key")
@@ -18,9 +19,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORK_DIR = os.path.join(BASE_DIR, "work")
 os.makedirs(WORK_DIR, exist_ok=True)
 
-KEYSTORE_PATH = os.path.join(BASE_DIR, "debug.keystore")
-KEYSTORE_PASS = "android"
-KEY_ALIAS = "androiddebugkey"
+APKTOOL_JAR = os.environ.get("APKTOOL_JAR", "/opt/apktool.jar")
+SIGNER_JAR = os.environ.get("SIGNER_JAR", "/opt/uber-apk-signer.jar")
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp")
+AUDIO_EXT = (".mp3", ".ogg", ".wav", ".m4a")
+ICON_NAME_HINT = "ic_launcher"
 
 app = Flask(__name__)
 app.secret_key = APP_SECRET
@@ -36,57 +40,177 @@ def login_required(view_func):
     return wrapped
 
 
-def new_job_dir():
-    job_id = uuid.uuid4().hex
-    job_dir = os.path.join(WORK_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    return job_dir
+def job_dir_for(job_id):
+    return os.path.join(WORK_DIR, job_id)
 
 
-def ensure_debug_keystore():
-    """Create a debug keystore once, so converted APKs can be signed."""
-    if os.path.exists(KEYSTORE_PATH):
-        return
+def current_job_dir():
+    job_id = session.get("job_id")
+    if not job_id:
+        return None
+    d = job_dir_for(job_id)
+    if not os.path.isdir(d):
+        return None
+    return d
+
+
+def safe_join(base, rel_path):
+    """Resolve rel_path under base, refusing to leave the sandbox."""
+    base = os.path.realpath(base)
+    target = os.path.realpath(os.path.join(base, rel_path))
+    if not (target == base or target.startswith(base + os.sep)):
+        abort(400, "Invalid path")
+    return target
+
+
+# ---------------------------------------------------------------- apktool
+
+def run_apktool_decode(apk_path, decoded_dir):
+    if os.path.isdir(decoded_dir):
+        shutil.rmtree(decoded_dir)
+    result = subprocess.run(
+        ["java", "-jar", APKTOOL_JAR, "d", "-f", "-o", decoded_dir, apk_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:] or "apktool decode failed")
+
+
+def run_apktool_build(decoded_dir, out_apk_path):
+    os.makedirs(os.path.dirname(out_apk_path), exist_ok=True)
+    result = subprocess.run(
+        ["java", "-jar", APKTOOL_JAR, "b", decoded_dir, "-o", out_apk_path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:] or "apktool build failed")
+
+
+def sign_apk(unsigned_apk_path, signed_out_dir):
+    os.makedirs(signed_out_dir, exist_ok=True)
+    result = subprocess.run(
+        ["java", "-jar", SIGNER_JAR, "-a", unsigned_apk_path, "--out", signed_out_dir],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-2000:] or "signing failed")
+    for f in os.listdir(signed_out_dir):
+        if f.endswith("-aligned-debugSigned.apk") or f.endswith("-debugSigned.apk"):
+            return os.path.join(signed_out_dir, f)
+    # fall back to any apk produced
+    for f in os.listdir(signed_out_dir):
+        if f.endswith(".apk"):
+            return os.path.join(signed_out_dir, f)
+    raise RuntimeError("Signed APK not found in output")
+
+
+# ------------------------------------------------------------- asset scan
+
+def scan_assets(decoded_dir):
+    icons, images, audio = [], [], []
+
+    for root, _dirs, files in os.walk(decoded_dir):
+        rel_root = os.path.relpath(root, decoded_dir)
+        # Skip compiled code and build metadata — not editable content
+        if rel_root.split(os.sep)[0] in ("smali", "original", "build", "unknown"):
+            continue
+        for fname in files:
+            lower = fname.lower()
+            rel_path = os.path.normpath(os.path.join(rel_root, fname))
+            if lower.endswith(IMAGE_EXT):
+                (icons if ICON_NAME_HINT in lower else images).append(rel_path)
+            elif lower.endswith(AUDIO_EXT):
+                audio.append(rel_path)
+
+    images.sort()
+    audio.sort()
+    icons.sort()
+
+    app_name = read_app_name(decoded_dir)
+    colors = read_colors(decoded_dir)
+
+    return {
+        "icons": icons[:20],
+        "images": images[:150],
+        "audio": audio[:150],
+        "app_name": app_name,
+        "colors": colors,
+        "truncated_images": len(images) > 150,
+        "truncated_audio": len(audio) > 150,
+    }
+
+
+def strings_xml_path(decoded_dir):
+    return os.path.join(decoded_dir, "res", "values", "strings.xml")
+
+
+def colors_xml_path(decoded_dir):
+    return os.path.join(decoded_dir, "res", "values", "colors.xml")
+
+
+def read_app_name(decoded_dir):
+    path = strings_xml_path(decoded_dir)
+    if not os.path.exists(path):
+        return None
     try:
-        subprocess.run(
-            [
-                "keytool", "-genkeypair", "-v",
-                "-keystore", KEYSTORE_PATH,
-                "-alias", KEY_ALIAS,
-                "-storepass", KEYSTORE_PASS,
-                "-keypass", KEYSTORE_PASS,
-                "-keyalg", "RSA", "-keysize", "2048",
-                "-validity", "10000",
-                "-dname", "CN=Android Debug,O=Android,C=US",
-            ],
-            check=True, capture_output=True,
-        )
-    except Exception:
-        # Signing is a best-effort convenience; conversion still works without it.
+        tree = ET.parse(path)
+        for el in tree.getroot().findall("string"):
+            if el.get("name") == "app_name":
+                return el.text or ""
+    except ET.ParseError:
         pass
+    return None
 
 
-def sign_apk(apk_path):
-    """Best-effort debug signing so the rebuilt APK can be installed."""
-    if not os.path.exists(KEYSTORE_PATH):
+def write_app_name(decoded_dir, new_name):
+    path = strings_xml_path(decoded_dir)
+    if not os.path.exists(path):
         return False
+    tree = ET.parse(path)
+    for el in tree.getroot().findall("string"):
+        if el.get("name") == "app_name":
+            el.text = new_name
+            tree.write(path, encoding="utf-8", xml_declaration=True)
+            return True
+    return False
+
+
+def read_colors(decoded_dir):
+    path = colors_xml_path(decoded_dir)
+    if not os.path.exists(path):
+        return []
     try:
-        subprocess.run(
-            [
-                "jarsigner",
-                "-keystore", KEYSTORE_PATH,
-                "-storepass", KEYSTORE_PASS,
-                "-keypass", KEYSTORE_PASS,
-                "-sigalg", "SHA256withRSA",
-                "-digestalg", "SHA-256",
-                apk_path, KEY_ALIAS,
-            ],
-            check=True, capture_output=True,
-        )
-        return True
-    except Exception:
-        return False
+        tree = ET.parse(path)
+    except ET.ParseError:
+        return []
+    out = []
+    for el in tree.getroot().findall("color"):
+        name = el.get("name")
+        value = (el.text or "").strip()
+        if name and re.match(r"^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$", value):
+            out.append({"name": name, "value": value})
+    return out
 
+
+def write_colors(decoded_dir, updates):
+    path = colors_xml_path(decoded_dir)
+    if not os.path.exists(path):
+        return False
+    tree = ET.parse(path)
+    changed = False
+    for el in tree.getroot().findall("color"):
+        name = el.get("name")
+        if name in updates:
+            new_val = updates[name].strip()
+            if re.match(r"^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$", new_val):
+                el.text = new_val
+                changed = True
+    if changed:
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+    return changed
+
+
+# ----------------------------------------------------------------- routes
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -109,60 +233,131 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    return render_template("dashboard.html")
+    job_dir = current_job_dir()
+    return render_template("dashboard.html", has_project=bool(job_dir))
 
 
-@app.route("/convert/apk-to-zip", methods=["POST"])
+@app.route("/upload", methods=["POST"])
 @login_required
-def apk_to_zip():
+def upload():
     uploaded = request.files.get("file")
     if not uploaded or not uploaded.filename.lower().endswith(".apk"):
         flash("Please upload a .apk file.")
         return redirect(url_for("dashboard"))
 
-    job_dir = new_job_dir()
-    apk_path = os.path.join(job_dir, "input.apk")
+    job_id = uuid.uuid4().hex
+    job_dir = job_dir_for(job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    apk_path = os.path.join(job_dir, "source.apk")
     uploaded.save(apk_path)
 
-    base_name = os.path.splitext(os.path.basename(uploaded.filename))[0]
-    zip_path = os.path.join(job_dir, base_name + ".zip")
+    try:
+        run_apktool_decode(apk_path, os.path.join(job_dir, "decoded"))
+    except RuntimeError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        flash("Could not open that APK: " + str(exc)[:300])
+        return redirect(url_for("dashboard"))
 
-    # An APK is itself a ZIP archive, so the safest "conversion" is a
-    # direct byte copy with a renamed extension (no re-compression that
-    # could disturb the archive's internal structure).
-    shutil.copyfile(apk_path, zip_path)
-
-    return send_file(zip_path, as_attachment=True,
-                      download_name=base_name + ".zip")
+    session["job_id"] = job_id
+    return redirect(url_for("project"))
 
 
-@app.route("/convert/zip-to-apk", methods=["POST"])
+@app.route("/project")
 @login_required
-def zip_to_apk():
+def project():
+    job_dir = current_job_dir()
+    if not job_dir:
+        flash("Upload an APK first.")
+        return redirect(url_for("dashboard"))
+    data = scan_assets(os.path.join(job_dir, "decoded"))
+    return render_template("project.html", **data)
+
+
+@app.route("/project/asset")
+@login_required
+def asset_preview():
+    job_dir = current_job_dir()
+    if not job_dir:
+        abort(404)
+    rel_path = request.args.get("path", "")
+    full_path = safe_join(os.path.join(job_dir, "decoded"), rel_path)
+    if not os.path.isfile(full_path):
+        abort(404)
+    return send_file(full_path)
+
+
+@app.route("/project/rename", methods=["POST"])
+@login_required
+def rename_app():
+    job_dir = current_job_dir()
+    if not job_dir:
+        return redirect(url_for("dashboard"))
+    new_name = request.form.get("app_name", "").strip()
+    if new_name:
+        write_app_name(os.path.join(job_dir, "decoded"), new_name)
+        flash("App name updated.")
+    return redirect(url_for("project"))
+
+
+@app.route("/project/colors", methods=["POST"])
+@login_required
+def update_colors():
+    job_dir = current_job_dir()
+    if not job_dir:
+        return redirect(url_for("dashboard"))
+    updates = {
+        key[len("color:"):]: value
+        for key, value in request.form.items()
+        if key.startswith("color:")
+    }
+    if write_colors(os.path.join(job_dir, "decoded"), updates):
+        flash("Colors updated.")
+    return redirect(url_for("project"))
+
+
+@app.route("/project/replace", methods=["POST"])
+@login_required
+def replace_asset():
+    job_dir = current_job_dir()
+    if not job_dir:
+        return redirect(url_for("dashboard"))
+    rel_path = request.form.get("rel_path", "")
     uploaded = request.files.get("file")
-    if not uploaded or not uploaded.filename.lower().endswith(".zip"):
-        flash("Please upload a .zip file.")
+    if not rel_path or not uploaded or uploaded.filename == "":
+        flash("Choose a replacement file first.")
+        return redirect(url_for("project"))
+
+    target = safe_join(os.path.join(job_dir, "decoded"), rel_path)
+    if not os.path.isfile(target):
+        abort(404)
+    uploaded.save(target)
+    flash(os.path.basename(rel_path) + " replaced.")
+    return redirect(url_for("project"))
+
+
+@app.route("/project/build", methods=["POST"])
+@login_required
+def build_project():
+    job_dir = current_job_dir()
+    if not job_dir:
         return redirect(url_for("dashboard"))
 
-    job_dir = new_job_dir()
-    zip_path = os.path.join(job_dir, "input.zip")
-    uploaded.save(zip_path)
+    decoded_dir = os.path.join(job_dir, "decoded")
+    unsigned_apk = os.path.join(job_dir, "build", "unsigned.apk")
+    signed_dir = os.path.join(job_dir, "build", "signed")
 
-    if not zipfile.is_zipfile(zip_path):
-        flash("That file is not a valid zip archive.")
-        return redirect(url_for("dashboard"))
+    try:
+        run_apktool_build(decoded_dir, unsigned_apk)
+        signed_apk = sign_apk(unsigned_apk, signed_dir)
+    except RuntimeError as exc:
+        flash("Build failed: " + str(exc)[:300])
+        return redirect(url_for("project"))
 
-    base_name = os.path.splitext(os.path.basename(uploaded.filename))[0]
-    apk_path = os.path.join(job_dir, base_name + ".apk")
-    shutil.copyfile(zip_path, apk_path)
-
-    ensure_debug_keystore()
-    sign_apk(apk_path)
-
-    return send_file(apk_path, as_attachment=True,
-                      download_name=base_name + ".apk")
+    app_name = read_app_name(decoded_dir) or "app"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", app_name) or "app"
+    return send_file(signed_apk, as_attachment=True,
+                      download_name=safe_name + ".apk")
 
 
 if __name__ == "__main__":
-    ensure_debug_keystore()
     app.run(host="0.0.0.0", port=80)
